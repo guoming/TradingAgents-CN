@@ -6,11 +6,25 @@
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime
+import re
 
 from app.core.database import get_mongo_db
 # from app.models.screening import ScreeningCondition  # 避免循环导入
 
 logger = logging.getLogger(__name__)
+
+_SCREENING_DATA_SOURCES = frozenset({"tushare", "akshare", "baostock"})
+
+
+def _normalize_screening_source(raw: Optional[str]) -> Optional[str]:
+    if raw is None or not isinstance(raw, str):
+        return None
+    t = raw.strip().lower()
+    if t in _SCREENING_DATA_SOURCES:
+        return t
+    if raw and str(raw).strip():
+        logger.warning(f"未识别的筛选数据源 {raw!r}，将忽略并按系统自动优先级处理")
+    return None
 
 
 class DatabaseScreeningService:
@@ -99,8 +113,9 @@ class DatabaseScreeningService:
         limit: int = 50,
         offset: int = 0,
         order_by: Optional[List[Dict[str, str]]] = None,
-        source: Optional[str] = None
-    ) -> Tuple[List[Dict[str, Any]], int]:
+        source: Optional[str] = None,
+        strict_data_source: bool = False,
+    ) -> Tuple[List[Dict[str, Any]], int, Optional[str]]:
         """
         基于数据库进行股票筛选
 
@@ -110,16 +125,67 @@ class DatabaseScreeningService:
             offset: 偏移量
             order_by: 排序条件 [{"field": "total_mv", "direction": "desc"}]
             source: 数据源（可选），默认使用优先级最高的数据源
+            strict_data_source: 为 True 且 source 合法时，仅查询该源，不跨源回退、不兜底 all
 
         Returns:
-            Tuple[List[Dict], int]: (筛选结果, 总数量)
+            Tuple[List[Dict], int, Optional[str]]: (筛选结果, 总数量, 实际命中的数据源标识；跨源合并兜底时为 \"all\")
         """
         try:
             db = get_mongo_db()
             collection = db[self.collection_name]
 
-            # 🔥 获取数据源优先级配置
-            if not source:
+            explicit = _normalize_screening_source(source)
+            strict = bool(strict_data_source and explicit)
+
+            # 构建查询条件（现在视图已包含实时行情数据，可以直接查询所有字段）
+            base_query = await self._build_query(conditions)
+            sort_conditions = self._build_sort_conditions(order_by)
+
+            async def _query_with_source(current_source: Optional[str]) -> Tuple[List[Dict[str, Any]], int]:
+                query = dict(base_query)
+                if current_source:
+                    source_regex = {"$regex": f"^{re.escape(current_source)}$", "$options": "i"}
+                    query["$or"] = [
+                        {"source": source_regex},
+                        {"data_source": source_regex},
+                    ]
+
+                logger.info(f"📋 数据库查询条件: {query}")
+                total_count = await collection.count_documents(query)
+                if total_count == 0:
+                    return [], 0
+
+                cursor = collection.find(query)
+                if sort_conditions:
+                    cursor = cursor.sort(sort_conditions)
+                cursor = cursor.skip(offset).limit(limit)
+
+                results_local: List[Dict[str, Any]] = []
+                codes_local: List[str] = []
+                async for doc in cursor:
+                    results_local.append(self._format_result(doc))
+                    codes_local.append(doc.get("code"))
+
+                if codes_local:
+                    await self._enrich_with_financial_data(
+                        results_local,
+                        codes_local,
+                        financial_data_source=current_source,
+                    )
+
+                return results_local, total_count
+
+            if strict and explicit:
+                results, total_count = await _query_with_source(explicit)
+                tag = explicit
+                logger.info(
+                    f"✅ 数据库筛选完成(严格源): 总数={total_count}, 返回={len(results)}, 数据源={tag}"
+                )
+                return results, total_count, tag
+
+            # 自动优先级：未传 source 时从配置读取
+            enabled_sources: List[str] = []
+            if not explicit:
                 from app.core.unified_config import UnifiedConfigManager
                 config = UnifiedConfigManager()
                 data_source_configs = await config.get_data_source_configs_async()
@@ -128,7 +194,6 @@ class DatabaseScreeningService:
                 for ds in data_source_configs:
                     logger.info(f"   - {ds.name}: type={ds.type}, priority={ds.priority}, enabled={ds.enabled}")
 
-                # 提取启用的数据源，按优先级排序
                 enabled_sources = [
                     ds.type.lower() for ds in data_source_configs
                     if ds.enabled and ds.type.lower() in ['tushare', 'akshare', 'baostock']
@@ -140,50 +205,28 @@ class DatabaseScreeningService:
                     enabled_sources = ['tushare', 'akshare', 'baostock']
                     logger.warning(f"⚠️ [database_screening] 没有启用的数据源，使用默认: {enabled_sources}")
 
-                source = enabled_sources[0] if enabled_sources else 'tushare'
-                logger.info(f"✅ [database_screening] 最终使用的数据源: {source}")
+                first_source = enabled_sources[0] if enabled_sources else 'tushare'
+                logger.info(f"✅ [database_screening] 初始使用的数据源: {first_source}")
+            else:
+                first_source = explicit
+                enabled_sources = [explicit] if explicit else ['tushare', 'akshare', 'baostock']
 
-            # 构建查询条件（现在视图已包含实时行情数据，可以直接查询所有字段）
-            query = await self._build_query(conditions)
+            attempted_sources: List[Optional[str]] = []
+            for src in [first_source] + [s for s in enabled_sources if s != first_source]:
+                if src in attempted_sources:
+                    continue
+                attempted_sources.append(src)
+                results, total_count = await _query_with_source(src)
+                if total_count > 0:
+                    used = src if src is not None else "all"
+                    logger.info(f"✅ 数据库筛选完成: 总数={total_count}, 返回={len(results)}, 数据源={used}")
+                    return results, total_count, src
 
-            # 🔥 添加数据源筛选
-            query["source"] = source
+            results, total_count = await _query_with_source(None)
+            logger.info(f"✅ 数据库筛选完成: 总数={total_count}, 返回={len(results)}, 数据源=all")
+            tag = "all" if total_count else None
+            return results, total_count, tag
 
-            logger.info(f"📋 数据库查询条件: {query}")
-
-            # 构建排序条件
-            sort_conditions = self._build_sort_conditions(order_by)
-
-            # 获取总数
-            total_count = await collection.count_documents(query)
-
-            # 执行查询
-            cursor = collection.find(query)
-
-            # 应用排序
-            if sort_conditions:
-                cursor = cursor.sort(sort_conditions)
-
-            # 应用分页
-            cursor = cursor.skip(offset).limit(limit)
-
-            # 获取结果
-            results = []
-            codes = []
-            async for doc in cursor:
-                # 转换结果格式
-                result = self._format_result(doc)
-                results.append(result)
-                codes.append(doc.get("code"))
-
-            # 批量查询财务数据（ROE等）- 如果视图中没有包含
-            if codes:
-                await self._enrich_with_financial_data(results, codes)
-
-            logger.info(f"✅ 数据库筛选完成: 总数={total_count}, 返回={len(results)}, 数据源={source}")
-
-            return results, total_count
-            
         except Exception as e:
             logger.error(f"❌ 数据库筛选失败: {e}")
             raise Exception(f"数据库筛选失败: {str(e)}")
@@ -250,7 +293,12 @@ class DatabaseScreeningService:
         
         return sort_conditions
     
-    async def _enrich_with_financial_data(self, results: List[Dict[str, Any]], codes: List[str]) -> None:
+    async def _enrich_with_financial_data(
+        self,
+        results: List[Dict[str, Any]],
+        codes: List[str],
+        financial_data_source: Optional[str] = None,
+    ) -> None:
         """
         批量查询财务数据并填充到结果中
 
@@ -262,22 +310,23 @@ class DatabaseScreeningService:
             db = get_mongo_db()
             financial_collection = db['stock_financial_data']
 
-            # 🔥 获取数据源优先级配置
-            from app.core.unified_config import UnifiedConfigManager
-            config = UnifiedConfigManager()
-            data_source_configs = await config.get_data_source_configs_async()
+            preferred_source: str
+            if financial_data_source:
+                preferred_source = str(financial_data_source).strip().lower()
+            else:
+                from app.core.unified_config import UnifiedConfigManager
+                config = UnifiedConfigManager()
+                data_source_configs = await config.get_data_source_configs_async()
 
-            # 提取启用的数据源，按优先级排序
-            enabled_sources = [
-                ds.type.lower() for ds in data_source_configs
-                if ds.enabled and ds.type.lower() in ['tushare', 'akshare', 'baostock']
-            ]
+                enabled_sources = [
+                    ds.type.lower() for ds in data_source_configs
+                    if ds.enabled and ds.type.lower() in ['tushare', 'akshare', 'baostock']
+                ]
 
-            if not enabled_sources:
-                enabled_sources = ['tushare', 'akshare', 'baostock']
+                if not enabled_sources:
+                    enabled_sources = ['tushare', 'akshare', 'baostock']
 
-            # 优先使用优先级最高的数据源
-            preferred_source = enabled_sources[0] if enabled_sources else 'tushare'
+                preferred_source = enabled_sources[0] if enabled_sources else 'tushare'
 
             # 批量查询最新的财务数据
             # 按 code 分组，取每个 code 的最新一期数据（只查询优先级最高的数据源）
@@ -380,7 +429,7 @@ class DatabaseScreeningService:
             "macd_hist": None,
 
             # 元数据
-            "source": doc.get("source", "database"),
+            "source": doc.get("source") or doc.get("data_source") or "database",
             "updated_at": doc.get("updated_at"),
         }
         

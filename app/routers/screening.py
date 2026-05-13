@@ -1,5 +1,6 @@
 
 import logging
+import re
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
@@ -34,10 +35,15 @@ class ScreeningRequest(BaseModel):
     order_by: Optional[List[OrderByItem]] = None
     limit: int = Field(50, ge=1, le=500)
     offset: int = Field(0, ge=0)
+    data_source: Optional[str] = Field(
+        None,
+        description="股票基础数据源 tushare/akshare/baostock；不传则按系统优先级",
+    )
 
 class ScreeningResponse(BaseModel):
     total: int
     items: List[dict]
+    data_source_used: Optional[str] = None
 
 # 服务实例
 svc = ScreeningService()
@@ -172,7 +178,8 @@ async def run_screening(req: ScreeningRequest, user: dict = Depends(get_current_
             limit=req.limit,
             offset=req.offset,
             order_by=[{"field": o.field, "direction": o.direction} for o in (req.order_by or [])],
-            use_database_optimization=True
+            use_database_optimization=True,
+            data_source=req.data_source,
         )
 
         logger.info(f"[screening] 筛选完成: total={result.get('total')}, "
@@ -182,7 +189,11 @@ async def run_screening(req: ScreeningRequest, user: dict = Depends(get_current_
             sample = result['items'][:3]
             logger.info(f"[screening] 返回样例(前3条): {sample}")
 
-        return ScreeningResponse(total=result["total"], items=result["items"])
+        return ScreeningResponse(
+            total=result["total"],
+            items=result["items"],
+            data_source_used=result.get("data_source_used"),
+        )
 
     except Exception as e:
         logger.error(f"[screening] 处理失败: {e}", exc_info=True)
@@ -211,7 +222,8 @@ async def enhanced_screening(req: NewScreeningRequest, user: dict = Depends(get_
             limit=req.limit,
             offset=req.offset,
             order_by=req.order_by,
-            use_database_optimization=req.use_database_optimization
+            use_database_optimization=req.use_database_optimization,
+            data_source=req.data_source,
         )
 
         logger.info(f"[enhanced_screening] 筛选完成: total={result.get('total')}, "
@@ -222,7 +234,8 @@ async def enhanced_screening(req: NewScreeningRequest, user: dict = Depends(get_
             items=result["items"],
             took_ms=result.get("took_ms"),
             optimization_used=result.get("optimization_used"),
-            source=result.get("source")
+            source=result.get("source"),
+            data_source_used=result.get("data_source_used"),
         )
 
     except Exception as e:
@@ -302,76 +315,90 @@ async def get_industries(user: dict = Depends(get_current_user)):
 
         logger.info(f"[get_industries] 数据源优先级: {enabled_sources}")
 
-        # 🔥 按优先级查询：优先使用优先级最高的数据源
-        preferred_source = enabled_sources[0] if enabled_sources else 'tushare'
-
-        # 聚合查询：按行业分组并统计股票数量（只查询指定数据源）
-        pipeline = [
-            {
-                "$match": {
-                    "source": preferred_source,  # 🔥 只查询优先级最高的数据源
-                    "industry": {"$ne": None, "$ne": ""}  # 过滤空行业
-                }
-            },
-            {
-                "$group": {
-                    "_id": "$industry",
-                    "count": {"$sum": 1}
-                }
-            },
-            {"$sort": {"count": -1}},  # 按股票数量降序排序
-            {
-                "$project": {
-                    "industry": "$_id",
-                    "count": 1,
-                    "_id": 0
-                }
+        async def _aggregate_industries_by_source(current_source: Optional[str]) -> List[Dict[str, Any]]:
+            match_cond: Dict[str, Any] = {
+                "industry": {"$nin": [None, ""]}  # 过滤空行业
             }
-        ]
+            if current_source:
+                source_regex = {"$regex": f"^{re.escape(current_source)}$", "$options": "i"}
+                match_cond["$or"] = [
+                    {"source": source_regex},
+                    {"data_source": source_regex},
+                ]
 
-        industries = []
-        async for doc in collection.aggregate(pipeline):
-            # 清洗字段，避免 NaN/Inf 导致 JSON 序列化失败
-            raw_industry = doc.get("industry")
-            safe_industry = ""
-            try:
-                if raw_industry is None:
-                    safe_industry = ""
-                elif isinstance(raw_industry, float):
-                    if raw_industry != raw_industry or raw_industry in (float("inf"), float("-inf")):
+            pipeline = [
+                {"$match": match_cond},
+                {
+                    "$group": {
+                        "_id": "$industry",
+                        "count": {"$sum": 1}
+                    }
+                },
+                {"$sort": {"count": -1}},
+                {
+                    "$project": {
+                        "industry": "$_id",
+                        "count": 1,
+                        "_id": 0
+                    }
+                }
+            ]
+
+            result: List[Dict[str, Any]] = []
+            async for doc in collection.aggregate(pipeline):
+                raw_industry = doc.get("industry")
+                safe_industry = ""
+                try:
+                    if raw_industry is None:
                         safe_industry = ""
+                    elif isinstance(raw_industry, float):
+                        if raw_industry != raw_industry or raw_industry in (float("inf"), float("-inf")):
+                            safe_industry = ""
+                        else:
+                            safe_industry = str(raw_industry)
                     else:
                         safe_industry = str(raw_industry)
-                else:
-                    safe_industry = str(raw_industry)
-            except Exception:
-                safe_industry = ""
+                except Exception:
+                    safe_industry = ""
 
-            raw_count = doc.get("count", 0)
-            safe_count = 0
-            try:
-                if isinstance(raw_count, float):
-                    if raw_count != raw_count or raw_count in (float("inf"), float("-inf")):
-                        safe_count = 0
+                raw_count = doc.get("count", 0)
+                safe_count = 0
+                try:
+                    if isinstance(raw_count, float):
+                        if raw_count != raw_count or raw_count in (float("inf"), float("-inf")):
+                            safe_count = 0
+                        else:
+                            safe_count = int(raw_count)
                     else:
                         safe_count = int(raw_count)
-                else:
-                    safe_count = int(raw_count)
-            except Exception:
-                safe_count = 0
+                except Exception:
+                    safe_count = 0
 
-            industries.append({
-                "value": safe_industry,
-                "label": safe_industry,
-                "count": safe_count,
-            })
+                result.append({
+                    "value": safe_industry,
+                    "label": safe_industry,
+                    "count": safe_count,
+                })
+            return result
 
-        logger.info(f"[get_industries] 从数据源 {preferred_source} 返回 {len(industries)} 个行业")
+        industries: List[Dict[str, Any]] = []
+        used_source = "all"
+        for src in enabled_sources:
+            industries = await _aggregate_industries_by_source(src)
+            if industries:
+                used_source = src
+                break
+
+        # 回退：优先级源都为空时，去掉 source 限制
+        if not industries:
+            industries = await _aggregate_industries_by_source(None)
+
+        logger.info(f"[get_industries] 返回 {len(industries)} 个行业，数据源={used_source}")
 
         return {
             "industries": industries,
             "total": len(industries),
-            "source": preferred_source  # 🔥 返回数据来源
+            "source": used_source
         }
 
     except Exception as e:

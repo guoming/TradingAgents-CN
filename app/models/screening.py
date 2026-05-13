@@ -58,6 +58,12 @@ class ScreeningRequest(BaseModel):
     # 优化选项
     use_database_optimization: bool = Field(True, description="是否使用数据库优化")
 
+    # 股票基础数据数据源（仅数据库优化路径生效）：tushare / akshare / baostock；不传则按系统配置优先级并允许回退
+    data_source: Optional[str] = Field(
+        None,
+        description="筛选使用的股票基础数据源（小写 tushare/akshare/baostock）；缺省为系统自动优先级",
+    )
+
 
 class ScreeningResponse(BaseModel):
     """筛选响应"""
@@ -65,7 +71,11 @@ class ScreeningResponse(BaseModel):
     items: List[Dict[str, Any]] = Field(..., description="筛选结果")
     took_ms: Optional[int] = Field(None, description="耗时(毫秒)")
     optimization_used: Optional[str] = Field(None, description="使用的优化方式")
-    source: Optional[str] = Field(None, description="数据源")
+    source: Optional[str] = Field(None, description="结果来源：mongodb / api / error 等")
+    data_source_used: Optional[str] = Field(
+        None,
+        description="本次筛选实际命中的股票基础数据源（如 tushare）；数据库路径未命中时可能为 null",
+    )
 
 
 class FieldInfo(BaseModel):

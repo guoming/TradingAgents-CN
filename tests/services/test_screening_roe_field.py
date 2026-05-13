@@ -62,7 +62,7 @@ def test_database_screening_formats_roe_in_result(monkeypatch):
 
     async def _run():
         svc = DatabaseScreeningService()
-        items, total = await svc.screen_stocks(
+        items, total, _ = await svc.screen_stocks(
             conditions=[{"field": "roe", "operator": ">=", "value": 5}],
             limit=50,
             offset=0,

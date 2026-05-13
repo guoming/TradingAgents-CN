@@ -9,6 +9,8 @@ export interface ScreeningRunReq {
   order_by?: ScreeningOrderBy[]
   limit?: number
   offset?: number
+  /** tushare / akshare / baostock；不传则按系统配置优先级 */
+  data_source?: string | null
 }
 
 export interface ScreeningRunItem {
@@ -26,7 +28,12 @@ export interface ScreeningRunItem {
   macd_hist?: number
 }
 
-export interface ScreeningRunResp { total: number; items: ScreeningRunItem[] }
+export interface ScreeningRunResp {
+  total: number
+  items: ScreeningRunItem[]
+  /** 本次实际命中的基础数据源（严格选择或自动回退后） */
+  data_source_used?: string | null
+}
 
 // 筛选字段配置
 export interface FieldInfo {

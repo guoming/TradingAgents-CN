@@ -17,12 +17,16 @@
         <div class="card-header">
           <div style="display: flex; align-items: center; gap: 12px;">
             <span>筛选条件</span>
-            <el-tag v-if="currentDataSource" type="info" size="small" effect="plain">
+            <el-tag v-if="currentDataSource && !filters.dataSource" type="info" size="small" effect="plain">
               <el-icon style="vertical-align: middle; margin-right: 4px;"><Connection /></el-icon>
               当前数据源: {{ currentDataSource.name }}
               <span v-if="currentDataSource.token_source_display" style="margin-left: 4px; opacity: 0.8;">
                 ({{ currentDataSource.token_source_display }})
               </span>
+            </el-tag>
+            <el-tag v-else-if="filters.dataSource" type="success" size="small" effect="plain">
+              <el-icon style="vertical-align: middle; margin-right: 4px;"><Connection /></el-icon>
+              本次指定: {{ filters.dataSource }}
             </el-tag>
             <el-tag v-else type="warning" size="small">
               <el-icon style="vertical-align: middle; margin-right: 4px;"><Warning /></el-icon>
@@ -69,6 +73,30 @@
           </el-col>
 
           <el-col :span="8">
+            <el-form-item label="筛选数据源">
+              <el-select
+                v-model="filters.dataSource"
+                placeholder="自动（系统优先级）"
+                clearable
+                filterable
+                style="width: 100%"
+              >
+                <el-option label="自动（系统优先级）" value="" />
+                <el-option
+                  v-for="ds in screeningDataSources"
+                  :key="ds.name"
+                  :label="dataSourceOptionLabel(ds)"
+                  :value="ds.name.toLowerCase()"
+                  :disabled="!ds.available"
+                />
+              </el-select>
+            </el-form-item>
+          </el-col>
+        </el-row>
+
+        <el-row :gutter="24">
+          <!-- 财务指标 -->
+          <el-col :span="8">
             <el-form-item label="市值范围">
               <el-select v-model="filters.marketCapRange" placeholder="选择市值范围">
                 <el-option label="小盘股 (< 100亿)" value="small" />
@@ -77,10 +105,7 @@
               </el-select>
             </el-form-item>
           </el-col>
-        </el-row>
 
-        <el-row :gutter="24">
-          <!-- 财务指标 -->
           <el-col :span="8">
             <el-form-item label="市盈率 (PE)">
               <el-input-number
@@ -120,7 +145,10 @@
               />
             </el-form-item>
           </el-col>
+        </el-row>
 
+        <el-row :gutter="24">
+          <!-- 财务 / 交易 -->
           <el-col :span="8">
             <el-form-item label="ROE (%)">
               <el-input-number
@@ -142,10 +170,7 @@
               />
             </el-form-item>
           </el-col>
-        </el-row>
 
-        <el-row :gutter="24">
-          <!-- 技术指标 -->
           <el-col :span="8">
             <el-form-item label="涨跌幅 (%)">
               <el-input-number
@@ -365,7 +390,7 @@ import { Search, Refresh, TrendCharts, Download, Star, Connection, Warning } fro
 import type { StockInfo } from '@/types/analysis'
 import { screeningApi, type FieldConfigResponse } from '@/api/screening'
 import { favoritesApi } from '@/api/favorites'
-import { getCurrentDataSource } from '@/api/sync'
+import { getCurrentDataSource, getDataSourcesStatus, type DataSourceStatus } from '@/api/sync'
 import { normalizeMarketForAnalysis, exchangeCodeToMarket, getMarketByStockCode } from '@/utils/market'
 
 // 响应式数据
@@ -379,6 +404,16 @@ const pageSize = ref(20)
 // 路由 & 自选集
 const router = useRouter()
 const favoriteSet = ref<Set<string>>(new Set())
+
+const SCREENING_DS_KEYS = new Set(['tushare', 'akshare', 'baostock'])
+
+// 筛选页可选的基础数据源（与后端 DatabaseScreeningService 一致）
+const screeningDataSources = ref<DataSourceStatus[]>([])
+
+function dataSourceOptionLabel(ds: DataSourceStatus): string {
+  const suffix = ds.available ? '' : ' · 不可用'
+  return `${ds.name}（优先级 ${ds.priority}）${suffix}`
+}
 
 // 当前数据源
 const currentDataSource = ref<{
@@ -397,6 +432,7 @@ const fieldsLoading = ref(false)
 const filters = reactive({
   market: 'A股',
   industry: [] as string[],
+  dataSource: '' as string,
   marketCapRange: '',
   peRatio: { min: null, max: null },
   pbRatio: { min: null, max: null },
@@ -493,6 +529,7 @@ const performScreening = async () => {
       order_by: [{ field: 'market_cap', direction: 'desc' as const }],
       limit: 500,
       offset: 0,
+      ...(filters.dataSource ? { data_source: filters.dataSource } : {}),
     }
 
     // 调试日志：打印请求payload
@@ -543,7 +580,12 @@ const performScreening = async () => {
       macd_hist: it.macd_hist,
     }))
 
-    ElMessage.success(`筛选完成，找到 ${screeningResults.value.length} 只股票`)
+    const dsUsed = data?.data_source_used as string | undefined
+    if (dsUsed) {
+      ElMessage.success(`筛选完成，找到 ${screeningResults.value.length} 只股票（命中数据源: ${dsUsed}）`)
+    } else {
+      ElMessage.success(`筛选完成，找到 ${screeningResults.value.length} 只股票`)
+    }
   } catch (error) {
     ElMessage.error('筛选失败，请重试')
   } finally {
@@ -555,6 +597,7 @@ const resetFilters = () => {
   Object.assign(filters, {
     market: 'A股',
     industry: [],
+    dataSource: '',
     marketCapRange: '',
     peRatio: { min: null, max: null },
     pbRatio: { min: null, max: null },
@@ -751,6 +794,19 @@ const loadFavorites = async () => {
   }
 }
 
+const loadScreeningDataSources = async () => {
+  try {
+    const response = await getDataSourcesStatus()
+    const raw = (response as any)?.data ?? []
+    screeningDataSources.value = (raw as DataSourceStatus[])
+      .filter((d) => SCREENING_DS_KEYS.has(String(d.name).toLowerCase()))
+      .sort((a, b) => a.priority - b.priority)
+  } catch (e) {
+    console.warn('加载筛选数据源列表失败', e)
+    screeningDataSources.value = []
+  }
+}
+
 // 获取当前数据源
 const loadCurrentDataSource = async () => {
   try {
@@ -768,6 +824,7 @@ onMounted(() => {
   // 加载字段配置和行业列表
   loadFieldConfig()
   loadIndustries()
+  loadScreeningDataSources()
   // 初始化自选状态
   loadFavorites()
   // 加载当前数据源

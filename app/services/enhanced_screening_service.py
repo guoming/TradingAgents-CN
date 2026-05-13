@@ -9,7 +9,10 @@ from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime
 
 from app.models.screening import ScreeningCondition, FieldType, BASIC_FIELDS_INFO
-from app.services.database_screening_service import get_database_screening_service
+from app.services.database_screening_service import (
+    get_database_screening_service,
+    _normalize_screening_source,
+)
 from app.services.screening_service import ScreeningService, ScreeningParams
 
 logger = logging.getLogger(__name__)
@@ -40,7 +43,8 @@ class EnhancedScreeningService:
         limit: int = 50,
         offset: int = 0,
         order_by: Optional[List[Dict[str, str]]] = None,
-        use_database_optimization: bool = True
+        use_database_optimization: bool = True,
+        data_source: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         智能股票筛选
@@ -54,11 +58,13 @@ class EnhancedScreeningService:
             offset: 偏移量
             order_by: 排序条件
             use_database_optimization: 是否使用数据库优化
+            data_source: 股票基础数据源 tushare/akshare/baostock；合法则仅查该源，不传则按系统优先级
 
         Returns:
             Dict: 筛选结果
         """
         start_time = time.time()
+        data_source_used: Optional[str] = None
 
         try:
             # 分析筛选条件
@@ -70,8 +76,8 @@ class EnhancedScreeningService:
                 not analysis["needs_technical_indicators"]):
 
                 # 使用数据库优化筛选
-                result = await self._screen_with_database(
-                    conditions, limit, offset, order_by
+                items, total, data_source_used = await self._screen_with_database(
+                    conditions, limit, offset, order_by, data_source=data_source
                 )
                 optimization_used = "database"
                 source = "mongodb"
@@ -83,10 +89,8 @@ class EnhancedScreeningService:
                 )
                 optimization_used = "traditional"
                 source = "api"
-
-            # 提取 items/total
-            items = result[0] if isinstance(result, tuple) else result.get("items", [])
-            total = result[1] if isinstance(result, tuple) else result.get("total", 0)
+                items = result.get("items", [])
+                total = result.get("total", 0)
 
             # 若使用数据库优化路径，则从数据库行情表进行富集（避免请求时外部调用）
             if source == "mongodb" and items:
@@ -132,6 +136,7 @@ class EnhancedScreeningService:
                 "took_ms": took_ms,
                 "optimization_used": optimization_used,
                 "source": source,
+                "data_source_used": data_source_used,
                 "analysis": analysis
             }
 
@@ -145,6 +150,7 @@ class EnhancedScreeningService:
                 "took_ms": took_ms,
                 "optimization_used": "none",
                 "source": "error",
+                "data_source_used": None,
                 "error": str(e)
             }
 
@@ -159,16 +165,22 @@ class EnhancedScreeningService:
         conditions: List[ScreeningCondition],
         limit: int,
         offset: int,
-        order_by: Optional[List[Dict[str, str]]]
-    ) -> Tuple[List[Dict[str, Any]], int]:
+        order_by: Optional[List[Dict[str, str]]],
+        data_source: Optional[str] = None,
+    ) -> Tuple[List[Dict[str, Any]], int, Optional[str]]:
         """使用数据库优化筛选"""
         logger.info("🚀 使用数据库优化筛选")
+
+        explicit = _normalize_screening_source(data_source)
+        strict = explicit is not None and isinstance(data_source, str) and bool(data_source.strip())
 
         return await self.db_service.screen_stocks(
             conditions=conditions,
             limit=limit,
             offset=offset,
-            order_by=order_by
+            order_by=order_by,
+            source=explicit,
+            strict_data_source=strict,
         )
 
     async def _screen_with_traditional_method(

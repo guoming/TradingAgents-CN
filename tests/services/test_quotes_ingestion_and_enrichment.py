@@ -50,14 +50,14 @@ def test_enhanced_screening_enriches_from_db(monkeypatch):
 
     # Patch db_service.screen_stocks to return minimal items with codes
     class _FakeDbService:
-        async def screen_stocks(self, conditions, limit, offset, order_by):
+        async def screen_stocks(self, conditions, limit, offset, order_by, **kwargs):
             items = [
                 {"code": "1", "name": "平安银行"},
                 {"code": "600000", "name": "浦发银行"},
                 {"code": "300750", "name": "宁德时代"},  # not present in quotes -> stays None
             ]
             total = len(items)
-            return items, total
+            return items, total, "tushare"
 
     async def _run():
         svc = EnhancedScreeningService()

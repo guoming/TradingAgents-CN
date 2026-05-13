@@ -39,7 +39,7 @@ async def test_screening():
             {"field": "pct_chg", "operator": "between", "value": [1, 10]}
         ]
         
-        results1, total1 = await service.screen_stocks(
+        results1, total1, _ = await service.screen_stocks(
             conditions=conditions1,
             limit=5,
             offset=0
@@ -60,7 +60,7 @@ async def test_screening():
             {"field": "amount", "operator": ">", "value": 10000}
         ]
         
-        results2, total2 = await service.screen_stocks(
+        results2, total2, _ = await service.screen_stocks(
             conditions=conditions2,
             limit=5,
             offset=0
@@ -82,7 +82,7 @@ async def test_screening():
             {"field": "amount", "operator": ">", "value": 10000}
         ]
         
-        results3, total3 = await service.screen_stocks(
+        results3, total3, _ = await service.screen_stocks(
             conditions=conditions3,
             limit=5,
             offset=0,

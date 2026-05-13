@@ -41,7 +41,7 @@ async def test_screening_fields():
         ]
         
         # 执行筛选
-        results, total = await service.screen_stocks(
+        results, total, _ = await service.screen_stocks(
             conditions=conditions,
             limit=3,
             order_by=[{"field": "total_mv", "direction": "desc"}]
