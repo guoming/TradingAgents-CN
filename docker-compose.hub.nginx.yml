@@ -19,8 +19,8 @@ services:
     image: mongo:4.4
     container_name: tradingagents-mongodb
     restart: unless-stopped
-    ports:
-      - "27017:27017"
+    #ports:
+    #  - "27017:27017"
     volumes:
       - tradingagents_mongodb_data:/data/db
       # 注意：不挂载初始化脚本，使用 MongoDB 自动创建的 root 用户
@@ -44,8 +44,8 @@ services:
     image: redis:7-alpine
     container_name: tradingagents-redis
     restart: unless-stopped
-    ports:
-      - "6379:6379"
+    #ports:
+    #  - "6379:6379"
     volumes:
       - tradingagents_redis_data:/data
     environment:
@@ -180,8 +180,8 @@ services:
     image: nginx:alpine
     container_name: tradingagents-nginx
     restart: unless-stopped
-    ports:
-      - "80:80" 
+    #ports:
+    #  - "80:80"
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
     depends_on:
